@@ -1,0 +1,1 @@
+This project aims to steal/predict/exfiltrate private data from other parties involved in a federated learning setup.
