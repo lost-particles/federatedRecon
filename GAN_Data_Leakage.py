@@ -1,4 +1,7 @@
 import sys
+
+from flwr.server.client_proxy import ClientProxy
+
 print(sys.executable)
 from collections import OrderedDict
 from typing import List, Tuple
@@ -23,6 +26,7 @@ from flwr_datasets import FederatedDataset
 import torchvision
 import os
 from torch.utils.tensorboard import SummaryWriter
+from PIL import Image
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -33,8 +37,8 @@ disable_progress_bar()
 dataset = "mnist"
 
 
-NUM_CLIENTS = 10
-BATCH_SIZE = 32
+NUM_CLIENTS = 5
+BATCH_SIZE = 64
 
 def load_datasets(partition_id: int):
     fds = FederatedDataset(dataset=dataset, partitioners={"train": NUM_CLIENTS})
@@ -47,20 +51,30 @@ def load_datasets(partition_id: int):
     ])
 
     def apply_transforms(batch):
-        batch["img"] = [pytorch_transforms(img) for img in batch["img"]]
+        if "image" in batch:
+            # Apply transforms individually and stack into a single tensor
+            batch["image"] = torch.stack([
+                pytorch_transforms(Image.fromarray(img) if isinstance(img, np.ndarray) else img)
+                for img in batch["image"]
+            ])
         return batch
 
-    partition_train_test = partition_train_test.with_transform(apply_transforms)
+    partition_train_test = partition_train_test.map(apply_transforms, batched=True)
+    partition_train_test["train"].set_format(type="torch", columns=["image", "label"])
+    partition_train_test["test"].set_format(type="torch", columns=["image", "label"])
     trainloader = DataLoader(partition_train_test["train"], batch_size=BATCH_SIZE, shuffle=True)
     valloader = DataLoader(partition_train_test["test"], batch_size=BATCH_SIZE)
-    testset = fds.load_split("test").with_transform(apply_transforms)
+    testset = fds.load_split("test").map(apply_transforms, batched=True)
+    testset.set_format(type="torch", columns=["image", "label"])
     testloader = DataLoader(testset, batch_size=BATCH_SIZE)
 
     # Dynamically extract info
-    features = fds.dataset_info().features["img"]
-    input_channels = features.shape[0]
-    input_size = (features.shape[1], features.shape[2])
-    num_classes = fds.dataset_info().features["label"].num_classes
+    first_batch = next(iter(DataLoader(partition_train_test["train"], batch_size=1)))
+    print(type(first_batch["image"]))
+    image_sample = first_batch["image"][0]
+    input_channels = image_sample.shape[0]
+    input_size = (image_sample.shape[1], image_sample.shape[2])
+    num_classes = len(set(int(label) for label in partition_train_test["train"]["label"]))  # Rough estimate
 
     return trainloader, valloader, testloader, input_channels, input_size, num_classes
 
@@ -114,7 +128,7 @@ def train(net, trainloader, epochs: int, verbose=False):
     for epoch in range(epochs):
         correct, total, epoch_loss = 0, 0, 0.0
         for batch in trainloader:
-            images, labels = batch["img"].to(DEVICE), batch["label"].to(DEVICE)
+            images, labels = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
             optimizer.zero_grad()
             outputs = net(images)
             loss = criterion(outputs, labels)
@@ -137,7 +151,7 @@ def test(net, testloader):
     net.eval()
     with torch.no_grad():
         for batch in testloader:
-            images, labels = batch["img"].to(DEVICE), batch["label"].to(DEVICE)
+            images, labels = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
             outputs = net(images)
             loss += criterion(outputs, labels).item()
             _, predicted = torch.max(outputs.data, 1)
@@ -158,8 +172,6 @@ def get_parameters(net) -> List[np.ndarray]:
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
 
-
-
 # Flower Client Node
 #get_parameters: Return the current local model parameters
 #fit: Receive model parameters from the server, train the model on the local data, and return the updated model parameters to the server
@@ -175,11 +187,17 @@ class FlowerClient(NumPyClient):
         return get_parameters(self.net)
 
     def fit(self, parameters, config):
-        set_parameters(self.net, parameters)
-        train(self.net, self.trainloader, epochs=1)
-        return get_parameters(self.net), len(self.trainloader), {}
-
+        try:
+            set_parameters(self.net, parameters)
+            round_num = config.get("server_round", 0)
+            print(f'server round received in fit method: {round_num}')
+            train(self.net, self.trainloader, epochs=10, verbose=True)
+            return get_parameters(self.net), len(self.trainloader), {"server_round": round_num}
+        except Exception as e:
+            print(f"[Client {os.getpid()}] Fit failed: {e}")
+            raise e
     def evaluate(self, parameters, config):
+        print(f'params inside client evaluate: {parameters}')
         set_parameters(self.net, parameters)
         loss, accuracy = test(self.net, self.valloader)
         return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
@@ -188,23 +206,27 @@ class FlowerClient(NumPyClient):
 
 
 def client_fn(context: Context) -> Client:
-    partition_id = context.node_config["partition-id"]
-    trainloader, valloader, _, input_channels, input_size, num_classes = load_datasets(partition_id)
+    try:
+        partition_id = context.node_config["partition-id"]
+        trainloader, valloader, _, input_channels, input_size, num_classes = load_datasets(partition_id)
 
-    if partition_id == 0:
-        print("🌐 Adversarial Client Activated")
-        cnn_model = Net(input_channels, input_size, [6, 16], num_classes)
-        generator = Generator(noise_dim=100, out_channels=1)
-        return GANAdversaryClient(
-            global_cnn=cnn_model,
-            generator=generator,
-            latent_dim=100,
-            valloader=valloader,
-        ).to_client()
+        if partition_id == 0:
+            print("🌐 Adversarial Client Activated")
+            cnn_model = Net(input_channels, input_size, [6, 16], num_classes)
+            generator = Generator(noise_dim=100, out_channels=1)
+            return GANAdversaryClient(
+                global_cnn=cnn_model,
+                generator=generator,
+                latent_dim=100,
+                valloader=valloader,
+            ).to_client()
 
-    else:
-        net = Net(input_channels, input_size, [6, 16], num_classes).to(DEVICE)
-        return FlowerClient(net, trainloader, valloader).to_client()
+        else:
+            net = Net(input_channels, input_size, [6, 16], num_classes).to(DEVICE)
+            return FlowerClient(net, trainloader, valloader).to_client()
+    except Exception as e:
+        print(f"[Client {context.node_config.get('partition-id', '?')}] Failed in client_fn: {e}")
+        raise
 
 
 # Server Side averaging
@@ -218,13 +240,50 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
     return {"accuracy": sum(accuracies) / sum(examples)}
 
 
+from flwr.server.strategy import FedAvg
+from flwr.common import FitIns, EvaluateIns, Parameters
+from flwr.server.client_manager import ClientManager
+from typing import Dict, List, Tuple
+
+
+class FedAvgWithRound(FedAvg):
+    def configure_fit(
+        self,
+        server_round: int,
+        parameters: Parameters,
+        client_manager: ClientManager,
+    ) -> List[Tuple[ClientProxy, FitIns]]:
+        """Configure the next round of training by passing `server_round`."""
+        clients = client_manager.sample(
+            num_clients=int(self.fraction_fit * len(client_manager.all())),
+            min_num_clients=self.min_fit_clients,
+        )
+        fit_ins = FitIns(parameters=parameters, config={"server_round": server_round})
+        return [(client, fit_ins) for client in clients]
+
+    def configure_evaluate(
+        self,
+        server_round: int,
+        parameters: Parameters,
+        client_manager: ClientManager,
+    ) -> List[Tuple[ClientProxy, EvaluateIns]]:
+        """Configure evaluation and pass `server_round` to clients."""
+        clients = client_manager.sample(
+            num_clients=int(self.fraction_evaluate * len(client_manager.all())),
+            min_num_clients=self.min_evaluate_clients,
+        )
+        eval_ins = EvaluateIns(parameters=parameters, config={"server_round": server_round})
+        return [(client, eval_ins) for client in clients]
+
+
+
 # Create FedAvg strategy
-strategy = FedAvg(
+strategy = FedAvgWithRound(
     fraction_fit=1.0,  # Sample 100% of available clients for training
     fraction_evaluate=0.5,  # Sample 50% of available clients for evaluation
-    min_fit_clients=10,  # Never sample less than 10 clients for training
-    min_evaluate_clients=5,  # Never sample less than 5 clients for evaluation
-    min_available_clients=10,  # Wait until all 10 clients are available
+    min_fit_clients=NUM_CLIENTS,  # Never sample less than 10 clients for training
+    min_evaluate_clients=(NUM_CLIENTS // 2) + 1,  # Never sample less than 5 clients for evaluation
+    min_available_clients=NUM_CLIENTS,  # Wait until all 10 clients are available
     evaluate_metrics_aggregation_fn=weighted_average,
 )
 
@@ -361,7 +420,7 @@ def main():
     print(f"Data shape: {input_channels}x{input_size}, Num classes: {num_classes}")
 
     batch = next(iter(trainloader))
-    images, labels = batch["img"], batch["label"]
+    images, labels = batch["image"], batch["label"]
 
     # Reshape and convert images to a NumPy array
     # matplotlib requires images with the shape (height, width, 3)
@@ -395,7 +454,7 @@ def main():
 
     # When running on GPU, assign an entire GPU for each client
     if DEVICE == "cuda":
-        backend_config = {"client_resources": {"num_cpus": 1, "num_gpus": 1.0}}
+        backend_config = {"client_resources": {"num_cpus": 3, "num_gpus": 1.0}}
         # Refer to our Flower framework documentation for more details about Flower simulations
         # and how to set up the `backend_config`
 
@@ -407,6 +466,17 @@ def main():
         backend_config=backend_config,
     )
 
+def debugger():
+    dummy_context = Context(
+        run_id="test-run",
+        node_id="test-node",
+        state=None,
+        run_config={},
+        node_config={"partition-id": 0}
+    )
+    c = client_fn(dummy_context)
+    print("Client created successfully")
 
 if __name__ == "__main__":
     main()
+    #test()
