@@ -1,10 +1,7 @@
 import sys
-
 from flwr.server.client_proxy import ClientProxy
-
 print(sys.executable)
 from collections import OrderedDict
-from typing import List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,9 +21,19 @@ from flwr.simulation import run_simulation
 from flwr_datasets import FederatedDataset
 
 import torchvision
-import os
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
+
+from flwr.common import FitIns, EvaluateIns, Parameters
+from flwr.server.client_manager import ClientManager
+from typing import Dict, List, Tuple
+
+from datetime import datetime
+import json
+import os
+from collections import defaultdict
+import random
+
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -34,17 +41,65 @@ print(f"Training on {DEVICE}")
 print(f"Flower {flwr.__version__} / PyTorch {torch.__version__}")
 disable_progress_bar()
 
-dataset = "mnist"
-
-
+DATASET = "mnist"
 NUM_CLIENTS = 5
 BATCH_SIZE = 64
+CLIENT_EPOCHS = 10 # Number of epochs the local models are run by each client node
+GAN_EPOCHS = 50 # Number of Epochs our GAN generator is trained by the Advesary
+NUM_CLASSES = 2 # Number of classes for the model. Even though each client has data with only 2 classes, still we will set the class as 10 for each local model to keep the update consistent with the global model
+LABELS_PER_CLIENT = 2  # You can change this to any number ≤ total number of classes
+
+
+
+
+
+# At the top level of your script
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+RUN_DIR = os.path.join("gan_outputs", timestamp)
+os.makedirs(RUN_DIR, exist_ok=True)
+TB_DIR = os.path.join(RUN_DIR, "tensorboard")
+os.makedirs(TB_DIR, exist_ok=True)
 
 def load_datasets(partition_id: int):
-    fds = FederatedDataset(dataset=dataset, partitioners={"train": NUM_CLIENTS})
-    partition = fds.load_partition(partition_id)
-    partition_train_test = partition.train_test_split(test_size=0.2, seed=42)
+    fds = FederatedDataset(dataset=DATASET, partitioners={"train": NUM_CLIENTS})
+    full_dataset = fds.load_split("train")
 
+    global NUM_CLASSES
+
+    # Group indices by label
+    label_to_indices = defaultdict(list)
+    for idx, label in enumerate(full_dataset["label"]):
+        label_to_indices[label].append(idx)
+
+    for indices in label_to_indices.values():
+        random.shuffle(indices)
+
+    # Assign labels to clients deterministically
+    all_labels = sorted(label_to_indices.keys())
+    total_label_groups = len(all_labels) // LABELS_PER_CLIENT
+    if NUM_CLIENTS > total_label_groups:
+        raise ValueError("Too many clients for the number of available label groups.")
+
+    # Each client gets a distinct group of labels
+    label_groups = [
+        all_labels[i * LABELS_PER_CLIENT : (i + 1) * LABELS_PER_CLIENT]
+        for i in range(total_label_groups)
+    ]
+    client_labels = label_groups[partition_id % len(label_groups)]
+
+    # Gather sample indices for selected labels
+    client_indices = []
+    for label in client_labels:
+        count = len(label_to_indices[label]) // total_label_groups
+        client_indices.extend(label_to_indices[label][:count])
+
+    # Subset dataset
+    client_data = full_dataset.select(client_indices)
+
+    # Split into train/test
+    partition_train_test = client_data.train_test_split(test_size=0.2, seed=42)
+
+    # Transforms
     pytorch_transforms = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
@@ -52,7 +107,6 @@ def load_datasets(partition_id: int):
 
     def apply_transforms(batch):
         if "image" in batch:
-            # Apply transforms individually and stack into a single tensor
             batch["image"] = torch.stack([
                 pytorch_transforms(Image.fromarray(img) if isinstance(img, np.ndarray) else img)
                 for img in batch["image"]
@@ -62,19 +116,21 @@ def load_datasets(partition_id: int):
     partition_train_test = partition_train_test.map(apply_transforms, batched=True)
     partition_train_test["train"].set_format(type="torch", columns=["image", "label"])
     partition_train_test["test"].set_format(type="torch", columns=["image", "label"])
+
     trainloader = DataLoader(partition_train_test["train"], batch_size=BATCH_SIZE, shuffle=True)
     valloader = DataLoader(partition_train_test["test"], batch_size=BATCH_SIZE)
+
     testset = fds.load_split("test").map(apply_transforms, batched=True)
     testset.set_format(type="torch", columns=["image", "label"])
     testloader = DataLoader(testset, batch_size=BATCH_SIZE)
 
-    # Dynamically extract info
-    first_batch = next(iter(DataLoader(partition_train_test["train"], batch_size=1)))
-    print(type(first_batch["image"]))
+    first_batch = next(iter(trainloader))
     image_sample = first_batch["image"][0]
     input_channels = image_sample.shape[0]
     input_size = (image_sample.shape[1], image_sample.shape[2])
-    num_classes = len(set(int(label) for label in partition_train_test["train"]["label"]))  # Rough estimate
+    #num_classes = len(set(int(label) for label in partition_train_test["train"]["label"]))
+    #num_classes = NUM_CLASSES
+    num_classes = NUM_CLASSES = len(set(full_dataset["label"]))
 
     return trainloader, valloader, testloader, input_channels, input_size, num_classes
 
@@ -191,7 +247,7 @@ class FlowerClient(NumPyClient):
             set_parameters(self.net, parameters)
             round_num = config.get("server_round", 0)
             print(f'server round received in fit method: {round_num}')
-            train(self.net, self.trainloader, epochs=10, verbose=True)
+            train(self.net, self.trainloader, epochs=CLIENT_EPOCHS, verbose=True)
             return get_parameters(self.net), len(self.trainloader), {"server_round": round_num}
         except Exception as e:
             print(f"[Client {os.getpid()}] Fit failed: {e}")
@@ -219,6 +275,8 @@ def client_fn(context: Context) -> Client:
                 generator=generator,
                 latent_dim=100,
                 valloader=valloader,
+                run_dir=RUN_DIR,
+                tb_dir=TB_DIR,
             ).to_client()
 
         else:
@@ -239,11 +297,6 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
     # Aggregate and return custom metric (weighted average)
     return {"accuracy": sum(accuracies) / sum(examples)}
 
-
-from flwr.server.strategy import FedAvg
-from flwr.common import FitIns, EvaluateIns, Parameters
-from flwr.server.client_manager import ClientManager
-from typing import Dict, List, Tuple
 
 
 class FedAvgWithRound(FedAvg):
@@ -313,22 +366,38 @@ class Generator(nn.Module):
 
 
 class GANAdversaryClient(NumPyClient):
-    def __init__(self, global_cnn, generator, latent_dim, valloader):
+
+    def __init__(self, global_cnn, generator, latent_dim, valloader, run_dir, tb_dir):
         self.global_cnn = global_cnn.to(DEVICE)
         self.generator = generator.to(DEVICE)
         self.latent_dim = latent_dim
         self.valloader = valloader
-        self.output_dir = "gan_outputs"
-        self.tb_dir = os.path.join(self.output_dir, "tensorboard")
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.tb_dir, exist_ok=True)
+        self.run_dir = run_dir
+        self.tb_dir = tb_dir
+
+
+        # Save run configuration
+        run_config = {
+            "timestamp": timestamp,
+            "batch_size": BATCH_SIZE,
+            "latent_dim": latent_dim,
+            "generator_lr": 2e-4,
+            "dummy_model_lr": 1e-3,
+            "device": DEVICE,
+            "num_clients": NUM_CLIENTS,
+            "labels_per_client": LABELS_PER_CLIENT,
+            "CLIENT_EPOCHS": CLIENT_EPOCHS,
+            "GAN_EPOCHS": GAN_EPOCHS,
+            "gan_generator_steps": 10,
+            "description": "GAN adversary FL run with synthetic data and dummy model update"
+        }
+
+        with open(os.path.join(self.run_dir, "config.json"), "w") as f:
+            json.dump(run_config, f, indent=4)
+
         self.writer = SummaryWriter(log_dir=self.tb_dir)
 
-        # Dummy model to send updates (trained on random noise)
-        self.dummy_model = Net(
-            input_channels=1, input_size=(28, 28), conv_filters=[6, 16], num_classes=10
-        ).to(DEVICE)
-
+        self.dummy_model = Net(input_channels=1, input_size=(28, 28), conv_filters=[6, 16], num_classes=10).to(DEVICE)
         self.dummy_optimizer = torch.optim.Adam(self.dummy_model.parameters(), lr=1e-3)
         self.criterion = nn.CrossEntropyLoss()
 
@@ -352,21 +421,21 @@ class GANAdversaryClient(NumPyClient):
 
         # 3. Clone global model as Discriminator (frozen)
         discriminator = Net(
-            input_channels=1, input_size=(28, 28), conv_filters=[6, 16], num_classes=10
+            input_channels=1, input_size=(28, 28), conv_filters=[6, 16], num_classes=NUM_CLASSES
         ).to(DEVICE)
         set_parameters(discriminator, parameters)
         discriminator.eval()
 
         # 4. Train Generator to fool CNN (GAN step)
-        self.train_generator(discriminator, config.get("server_round", 0))
+        self.train_generator(discriminator, config.get("server_round", 0), GAN_EPOCHS)
 
         # Return deceptive updates to appear honest
-        return get_parameters(self.dummy_model), BATCH_SIZE, {}
+        return get_parameters(self.dummy_model), BATCH_SIZE, {"server_round": config.get("server_round", 0)}
 
     def train_generator(self, discriminator, round_num, steps=10):
         g_optimizer = torch.optim.Adam(self.generator.parameters(), lr=2e-4)
 
-        for _ in range(steps):
+        for step in range(steps):
             z = torch.randn(BATCH_SIZE, self.latent_dim, 1, 1).to(DEVICE)
             fake_imgs = self.generator(z)
 
@@ -376,11 +445,14 @@ class GANAdversaryClient(NumPyClient):
                 outputs = outputs.softmax(dim=1)
 
             # Use confidence on target digit (or total entropy) as the feedback signal
-            target_labels = torch.ones(BATCH_SIZE).to(DEVICE)
-            loss = -torch.mean(torch.sum(outputs, dim=1))  # inverse of confidence
+
+            confidence = torch.max(outputs, dim=1).values
+            loss = -torch.mean(confidence)
             g_optimizer.zero_grad()
             loss.backward()
             g_optimizer.step()
+            # Print loss per step
+            print(f"[Round {round_num} | Step {step + 1}/{steps}] Generator Loss: {loss.item():.4f}")
 
         # Log scalar loss
         self.writer.add_scalar("Generator/Loss", loss.item(), global_step=round_num)
@@ -390,7 +462,11 @@ class GANAdversaryClient(NumPyClient):
         self.writer.add_image("Generator/FakeImages", img_grid, global_step=round_num)
 
         # Also save to disk
-        torchvision.utils.save_image(img_grid, f"gan_outputs/round_{round_num:03}.png")
+        # Save image grid to disk
+        torchvision.utils.save_image(
+            img_grid,
+            os.path.join(self.run_dir, f"round_{round_num:03}.png")
+        )
 
     def evaluate(self, parameters, config):
         set_parameters(self.dummy_model, parameters)
@@ -454,7 +530,7 @@ def main():
 
     # When running on GPU, assign an entire GPU for each client
     if DEVICE == "cuda":
-        backend_config = {"client_resources": {"num_cpus": 3, "num_gpus": 1.0}}
+        backend_config = {"client_resources": {"num_cpus": 20, "num_gpus": 1.0}}
         # Refer to our Flower framework documentation for more details about Flower simulations
         # and how to set up the `backend_config`
 
