@@ -33,6 +33,7 @@ import json
 import os
 from collections import defaultdict
 import random
+from pathlib import Path
 
 
 
@@ -42,16 +43,16 @@ print(f"Flower {flwr.__version__} / PyTorch {torch.__version__}")
 disable_progress_bar()
 
 DATASET = "mnist"
-NUM_CLIENTS = 5
+NUM_CLIENTS = 2
 BATCH_SIZE = 64
 CLIENT_EPOCHS = 10 # Number of epochs the local models are run by each client node
-GAN_EPOCHS = 50 # Number of Epochs our GAN generator is trained by the Advesary
-NUM_CLASSES = 2 # Number of classes for the model. Even though each client has data with only 2 classes, still we will set the class as 10 for each local model to keep the update consistent with the global model
-LABELS_PER_CLIENT = 2  # You can change this to any number ≤ total number of classes
+GAN_EPOCHS = 20000 # Number of Epochs our GAN generator is trained by the Adversary
+NUM_CLASSES = 10 # Number of classes for the model. Even though each client has data with only 2 classes, still we will set the class as 10 for each local model to keep the update consistent with the global model
+LABELS_PER_CLIENT = 5  # You can change this to any number ≤ total number of classes
+NUM_ROUNDS = 5
 
-
-
-
+generator = None
+START_GAN_TRAINING = NUM_ROUNDS//2
 
 # At the top level of your script
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -59,6 +60,8 @@ RUN_DIR = os.path.join("gan_outputs", timestamp)
 os.makedirs(RUN_DIR, exist_ok=True)
 TB_DIR = os.path.join(RUN_DIR, "tensorboard")
 os.makedirs(TB_DIR, exist_ok=True)
+GAN_MODELS_DIR = os.path.join(RUN_DIR, "GAN_Models")
+os.makedirs(GAN_MODELS_DIR, exist_ok=True)
 
 def load_datasets(partition_id: int):
     fds = FederatedDataset(dataset=DATASET, partitioners={"train": NUM_CLIENTS})
@@ -262,16 +265,25 @@ class FlowerClient(NumPyClient):
 
 
 def client_fn(context: Context) -> Client:
+    global generator
     try:
         partition_id = context.node_config["partition-id"]
         trainloader, valloader, _, input_channels, input_size, num_classes = load_datasets(partition_id)
 
+        generator_path = Path(os.path.join(GAN_MODELS_DIR, "global_generator.pth"))
+
         if partition_id == 0:
             print("🌐 Adversarial Client Activated")
-            cnn_model = Net(input_channels, input_size, [6, 16], num_classes)
             generator = Generator(noise_dim=100, out_channels=1)
+            cnn_model = Net(input_channels, input_size, [6, 16], num_classes).to(DEVICE)
+            if generator_path.exists():
+                print("Loading existing Generator")
+                generator.load_state_dict(torch.load(generator_path))
+            else:
+                print("Initializing new Generator")
             return GANAdversaryClient(
                 global_cnn=cnn_model,
+                trainloader=trainloader,
                 generator=generator,
                 latent_dim=100,
                 valloader=valloader,
@@ -290,12 +302,19 @@ def client_fn(context: Context) -> Client:
 # Server Side averaging
 
 def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
-    # Multiply accuracy of each client by number of examples used
-    accuracies = [num_examples * m["accuracy"] for num_examples, m in metrics]
-    examples = [num_examples for num_examples, _ in metrics]
+    aggregated = {}
+    total_examples = sum(num_examples for num_examples, _ in metrics)
 
-    # Aggregate and return custom metric (weighted average)
-    return {"accuracy": sum(accuracies) / sum(examples)}
+    if not metrics or total_examples == 0:
+        return {}
+
+    metric_keys = metrics[0][1].keys()
+    for key in metric_keys:
+        total = sum(num_examples * m[key] for num_examples, m in metrics)
+        aggregated[key] = total / total_examples
+
+    return aggregated
+
 
 
 
@@ -338,6 +357,7 @@ strategy = FedAvgWithRound(
     min_evaluate_clients=(NUM_CLIENTS // 2) + 1,  # Never sample less than 5 clients for evaluation
     min_available_clients=NUM_CLIENTS,  # Wait until all 10 clients are available
     evaluate_metrics_aggregation_fn=weighted_average,
+    fit_metrics_aggregation_fn=weighted_average,
 )
 
 #Generator to be used by the Adversary
@@ -367,8 +387,9 @@ class Generator(nn.Module):
 
 class GANAdversaryClient(NumPyClient):
 
-    def __init__(self, global_cnn, generator, latent_dim, valloader, run_dir, tb_dir):
+    def __init__(self, global_cnn, trainloader, generator, latent_dim, valloader, run_dir, tb_dir):
         self.global_cnn = global_cnn.to(DEVICE)
+        self.trainloader = trainloader
         self.generator = generator.to(DEVICE)
         self.latent_dim = latent_dim
         self.valloader = valloader
@@ -397,27 +418,30 @@ class GANAdversaryClient(NumPyClient):
 
         self.writer = SummaryWriter(log_dir=self.tb_dir)
 
-        self.dummy_model = Net(input_channels=1, input_size=(28, 28), conv_filters=[6, 16], num_classes=10).to(DEVICE)
-        self.dummy_optimizer = torch.optim.Adam(self.dummy_model.parameters(), lr=1e-3)
-        self.criterion = nn.CrossEntropyLoss()
+        #self.dummy_model = Net(input_channels=1, input_size=(28, 28), conv_filters=[6, 16], num_classes=10).to(DEVICE)
+        #self.dummy_optimizer = torch.optim.Adam(self.dummy_model.parameters(), lr=1e-3)
+        #self.criterion = nn.CrossEntropyLoss()
 
     def get_parameters(self, config):
-        return get_parameters(self.dummy_model)
+        return get_parameters(self.global_cnn)
 
     def fit(self, parameters, config):
         # 1. Update dummy model with global weights
-        set_parameters(self.dummy_model, parameters)
+        set_parameters(self.global_cnn, parameters)
+        round_num = config.get("server_round", 0)
+        print(f'server round received in fit method: {round_num}')
+        train(self.global_cnn, self.trainloader, epochs=CLIENT_EPOCHS, verbose=True)
 
         # 2. Train dummy model on random data with fake labels (deceptive update)
-        self.dummy_model.train()
-        for _ in range(1):  # minimal 1 epoch
-            images = torch.randn(BATCH_SIZE, 1, 28, 28).to(DEVICE)
-            labels = torch.randint(0, 10, (BATCH_SIZE,), device=DEVICE)
-            self.dummy_optimizer.zero_grad()
-            outputs = self.dummy_model(images)
-            loss = self.criterion(outputs, labels)
-            loss.backward()
-            self.dummy_optimizer.step()
+        # self.dummy_model.train()
+        # for _ in range(1):  # minimal 1 epoch
+        #     images = torch.randn(BATCH_SIZE, 1, 28, 28).to(DEVICE)
+        #     labels = torch.randint(0, 10, (BATCH_SIZE,), device=DEVICE)
+        #     self.dummy_optimizer.zero_grad()
+        #     outputs = self.dummy_model(images)
+        #     loss = self.criterion(outputs, labels)
+        #     loss.backward()
+        #     self.dummy_optimizer.step()
 
         # 3. Clone global model as Discriminator (frozen)
         discriminator = Net(
@@ -427,51 +451,66 @@ class GANAdversaryClient(NumPyClient):
         discriminator.eval()
 
         # 4. Train Generator to fool CNN (GAN step)
-        self.train_generator(discriminator, config.get("server_round", 0), GAN_EPOCHS)
+        if round_num >= NUM_ROUNDS//2:
+            steps = min(500 + 500 * (round_num - START_GAN_TRAINING), 200000)  # Progressive GAN training
+            self.train_generator(discriminator, round_num, steps=steps)
+            generator_path = Path(os.path.join(GAN_MODELS_DIR, "global_generator.pth"))
+            torch.save(self.generator.state_dict(), generator_path)
 
         # Return deceptive updates to appear honest
-        return get_parameters(self.dummy_model), BATCH_SIZE, {"server_round": config.get("server_round", 0)}
+        #return get_parameters(self.dummy_model), BATCH_SIZE, {"server_round": round_num}
+        return get_parameters(self.global_cnn), len(self.trainloader), {"server_round": round_num}
 
     def train_generator(self, discriminator, round_num, steps=10):
         g_optimizer = torch.optim.Adam(self.generator.parameters(), lr=2e-4)
+        criterion = nn.CrossEntropyLoss()
+        target_class = 8
 
         for step in range(steps):
             z = torch.randn(BATCH_SIZE, self.latent_dim, 1, 1).to(DEVICE)
             fake_imgs = self.generator(z)
 
             # Use the frozen CNN as a Discriminator
-            outputs = discriminator(fake_imgs)
-            if isinstance(outputs, torch.Tensor) and outputs.ndim == 2:
-                outputs = outputs.softmax(dim=1)
-
+            # outputs = discriminator(fake_imgs)
+            # if isinstance(outputs, torch.Tensor) and outputs.ndim == 2:
+            #     outputs = outputs.softmax(dim=1)
             # Use confidence on target digit (or total entropy) as the feedback signal
 
-            confidence = torch.max(outputs, dim=1).values
-            loss = -torch.mean(confidence)
+            logits = discriminator(fake_imgs)
+            #labels = torch.randint(0, NUM_CLASSES, (logits.shape[0],), device=DEVICE)
+            # Ensure labels match the actual batch size
+            labels = torch.full((logits.shape[0],), target_class, dtype=torch.long, device=DEVICE)
+            loss = criterion(logits, labels)
+
             g_optimizer.zero_grad()
             loss.backward()
             g_optimizer.step()
             # Print loss per step
             print(f"[Round {round_num} | Step {step + 1}/{steps}] Generator Loss: {loss.item():.4f}")
 
-        # Log scalar loss
-        self.writer.add_scalar("Generator/Loss", loss.item(), global_step=round_num)
+            if step % 50 == 0:
+                self.generator.eval()
+                with torch.no_grad():
+                    z_vis = torch.randn(16, self.latent_dim, 1, 1).to(DEVICE)
+                    fake_imgs_vis = self.generator(z_vis)
+                    img_grid = torchvision.utils.make_grid(fake_imgs_vis, nrow=4, normalize=True)
+                    self.writer.add_image("Generator/FakeImages", img_grid, global_step=step)
+                    torchvision.utils.save_image(img_grid, os.path.join(self.run_dir, f"round_{round_num:03}_{step}.png"))
 
-        # Save image grid for TensorBoard
-        img_grid = torchvision.utils.make_grid(fake_imgs[:16], nrow=4, normalize=True)
-        self.writer.add_image("Generator/FakeImages", img_grid, global_step=round_num)
+                self.generator.train()
+                # Log scalar loss
+                self.writer.add_scalar("Generator/Loss", loss.item(), global_step=step)
 
-        # Also save to disk
-        # Save image grid to disk
-        torchvision.utils.save_image(
-            img_grid,
-            os.path.join(self.run_dir, f"round_{round_num:03}.png")
-        )
 
     def evaluate(self, parameters, config):
-        set_parameters(self.dummy_model, parameters)
-        loss, acc = test(self.dummy_model, self.valloader)
-        return float(loss), len(self.valloader), {"accuracy": float(acc)}
+        # set_parameters(self.dummy_model, parameters)
+        # loss, acc = test(self.dummy_model, self.valloader)
+        # return float(loss), len(self.valloader), {"accuracy": float(acc)}
+
+        print(f'params inside client evaluate: {parameters}')
+        set_parameters(self.global_cnn, parameters)
+        loss, accuracy = test(self.global_cnn, self.valloader)
+        return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
 
 
 
@@ -484,7 +523,7 @@ def server_fn(context: Context) -> ServerAppComponents:
     """
 
     # Configure the server for 5 rounds of training
-    config = ServerConfig(num_rounds=5)
+    config = ServerConfig(num_rounds=NUM_ROUNDS)
 
     return ServerAppComponents(strategy=strategy, config=config)
 

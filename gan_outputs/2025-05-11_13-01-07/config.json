@@ -1,0 +1,14 @@
+{
+    "timestamp": "2025-05-11_13-01-07",
+    "batch_size": 64,
+    "latent_dim": 100,
+    "generator_lr": 0.0002,
+    "dummy_model_lr": 0.001,
+    "device": "cuda",
+    "num_clients": 5,
+    "labels_per_client": 2,
+    "CLIENT_EPOCHS": 10,
+    "GAN_EPOCHS": 50,
+    "gan_generator_steps": 10,
+    "description": "GAN adversary FL run with synthetic data and dummy model update"
+}
