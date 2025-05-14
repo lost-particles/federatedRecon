@@ -44,15 +44,17 @@ disable_progress_bar()
 
 DATASET = "mnist"
 NUM_CLIENTS = 2
-BATCH_SIZE = 64
+BATCH_SIZE = 256
 CLIENT_EPOCHS = 10 # Number of epochs the local models are run by each client node
-GAN_EPOCHS = 20000 # Number of Epochs our GAN generator is trained by the Adversary
+GAN_EPOCHS = 200000 # Number of Epochs our GAN generator is trained by the Adversary
 NUM_CLASSES = 10 # Number of classes for the model. Even though each client has data with only 2 classes, still we will set the class as 10 for each local model to keep the update consistent with the global model
 LABELS_PER_CLIENT = 5  # You can change this to any number ≤ total number of classes
-NUM_ROUNDS = 5
+NUM_ROUNDS = 10
 
 generator = None
-START_GAN_TRAINING = NUM_ROUNDS//2
+START_GAN_TRAINING = (NUM_ROUNDS//2)
+
+print(f"Start Gan Training: {START_GAN_TRAINING}")
 
 # At the top level of your script
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -105,7 +107,7 @@ def load_datasets(partition_id: int):
     # Transforms
     pytorch_transforms = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        transforms.Normalize((0.5,), (0.5,))
     ])
 
     def apply_transforms(batch):
@@ -180,10 +182,10 @@ class Net(nn.Module):
 
 # Train and Test loop
 def train(net, trainloader, epochs: int, verbose=False):
-    """Train the network on the training set."""
     criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters())
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
     net.train()
+
     for epoch in range(epochs):
         correct, total, epoch_loss = 0, 0, 0.0
         for batch in trainloader:
@@ -192,16 +194,17 @@ def train(net, trainloader, epochs: int, verbose=False):
             outputs = net(images)
             loss = criterion(outputs, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)  # ✅ clip grads
             optimizer.step()
-            # Metrics
-            epoch_loss += loss
+
+            epoch_loss += loss.item() * labels.size(0)  # ✅ scale correctly
             total += labels.size(0)
-            correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
-        epoch_loss /= len(trainloader.dataset)
+            correct += (outputs.argmax(1) == labels).sum().item()
+
+        epoch_loss /= total
         epoch_acc = correct / total
         if verbose:
-            print(f"Epoch {epoch+1}: train loss {epoch_loss}, accuracy {epoch_acc}")
-
+            print(f"Epoch {epoch+1}: train loss {epoch_loss:.6f}, accuracy {epoch_acc:.4f}")
 
 def test(net, testloader):
     """Evaluate the network on the entire test set."""
@@ -256,7 +259,7 @@ class FlowerClient(NumPyClient):
             print(f"[Client {os.getpid()}] Fit failed: {e}")
             raise e
     def evaluate(self, parameters, config):
-        print(f'params inside client evaluate: {parameters}')
+        #print(f'params inside client evaluate: {parameters}')
         set_parameters(self.net, parameters)
         loss, accuracy = test(self.net, self.valloader)
         return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
@@ -274,7 +277,7 @@ def client_fn(context: Context) -> Client:
 
         if partition_id == 0:
             print("🌐 Adversarial Client Activated")
-            generator = Generator(noise_dim=100, out_channels=1)
+            generator = Generator(noise_dim=100, num_classes=NUM_CLASSES, out_channels=1)
             cnn_model = Net(input_channels, input_size, [6, 16], num_classes).to(DEVICE)
             if generator_path.exists():
                 print("Loading existing Generator")
@@ -360,29 +363,50 @@ strategy = FedAvgWithRound(
     fit_metrics_aggregation_fn=weighted_average,
 )
 
+class NormalizeToMNIST(nn.Module):
+    def __init__(self, mean=0.1307, std=0.3081):
+        super().__init__()
+        self.mean = mean
+        self.std = std
+
+    def forward(self, x):
+        # x in [-1, 1] → [0, 1] → normalize
+        x = (x + 1) / 2  # to [0, 1]
+        return (x - self.mean) / self.std
+
 #Generator to be used by the Adversary
 class Generator(nn.Module):
-    def __init__(self, noise_dim=100, out_channels=1, feature_maps=64):
+    def __init__(self, noise_dim=100, num_classes=10, out_channels=1, feature_maps=128):
         super(Generator, self).__init__()
-        self.net = nn.Sequential(
-            nn.ConvTranspose2d(noise_dim, feature_maps * 4, 3, 1, 0, bias=False),  # 1x1 -> 3x3
-            nn.BatchNorm2d(feature_maps * 4),
-            nn.ReLU(True),
+        self.label_emb = nn.Embedding(num_classes, num_classes)
 
-            nn.ConvTranspose2d(feature_maps * 4, feature_maps * 2, 4, 2, 1, bias=False),  # 3x3 -> 7x7
+        input_dim = noise_dim + num_classes
+        self.project = nn.Sequential(
+            nn.Linear(input_dim, feature_maps * 4 * 7 * 7),
+            nn.BatchNorm1d(feature_maps * 4 * 7 * 7),
+            nn.ReLU(True)
+        )
+
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(feature_maps * 4, feature_maps * 2, kernel_size=4, stride=2, padding=1),  # 7x7 → 14x14
             nn.BatchNorm2d(feature_maps * 2),
             nn.ReLU(True),
 
-            nn.ConvTranspose2d(feature_maps * 2, feature_maps, 4, 2, 1, bias=False),  # 7x7 -> 14x14
+            nn.ConvTranspose2d(feature_maps * 2, feature_maps, kernel_size=4, stride=2, padding=1),  # 14x14 → 28x28
             nn.BatchNorm2d(feature_maps),
             nn.ReLU(True),
 
-            nn.ConvTranspose2d(feature_maps, out_channels, 4, 2, 1, bias=False),  # 14x14 -> 28x28
+            nn.Conv2d(feature_maps, out_channels, kernel_size=3, stride=1, padding=1),  # 28x28
             nn.Tanh()
         )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, z, labels):
+        # Embed labels and concatenate
+        label_embed = self.label_emb(labels)
+        input_vec = torch.cat([z.squeeze(), label_embed], dim=1)
+        out = self.project(input_vec)
+        out = out.view(out.size(0), -1, 7, 7)
+        return self.net(out)
 
 
 class GANAdversaryClient(NumPyClient):
@@ -451,9 +475,9 @@ class GANAdversaryClient(NumPyClient):
         discriminator.eval()
 
         # 4. Train Generator to fool CNN (GAN step)
-        if round_num >= NUM_ROUNDS//2:
-            steps = min(500 + 500 * (round_num - START_GAN_TRAINING), 200000)  # Progressive GAN training
-            self.train_generator(discriminator, round_num, steps=steps)
+        if round_num >= START_GAN_TRAINING:
+            steps = min(2000 + 1000 * (round_num - START_GAN_TRAINING), GAN_EPOCHS)
+            self.train_generator_with_global_model_gradient(round_num, steps=steps)
             generator_path = Path(os.path.join(GAN_MODELS_DIR, "global_generator.pth"))
             torch.save(self.generator.state_dict(), generator_path)
 
@@ -463,55 +487,120 @@ class GANAdversaryClient(NumPyClient):
 
     def train_generator(self, discriminator, round_num, steps=10):
         g_optimizer = torch.optim.Adam(self.generator.parameters(), lr=2e-4)
-        criterion = nn.CrossEntropyLoss()
-        target_class = 8
+
+        # Disable softmax / cross entropy; use WGAN-style score maximization
+        discriminator.eval()
 
         for step in range(steps):
-            z = torch.randn(BATCH_SIZE, self.latent_dim, 1, 1).to(DEVICE)
+            z = torch.randn(BATCH_SIZE, self.latent_dim).to(DEVICE)
             fake_imgs = self.generator(z)
 
-            # Use the frozen CNN as a Discriminator
-            # outputs = discriminator(fake_imgs)
-            # if isinstance(outputs, torch.Tensor) and outputs.ndim == 2:
-            #     outputs = outputs.softmax(dim=1)
-            # Use confidence on target digit (or total entropy) as the feedback signal
-
+            # Pass through frozen discriminator (CNN)
             logits = discriminator(fake_imgs)
-            #labels = torch.randint(0, NUM_CLASSES, (logits.shape[0],), device=DEVICE)
-            # Ensure labels match the actual batch size
-            labels = torch.full((logits.shape[0],), target_class, dtype=torch.long, device=DEVICE)
-            loss = criterion(logits, labels)
+
+            # WGAN: generator loss is the negative of discriminator's output
+            # We want to maximize discriminator's confidence => minimize -score
+            #g_loss = -logits.mean()
+            # Use discriminator's most confident class score
+            g_loss = -logits.max(dim=1)[0].mean()
 
             g_optimizer.zero_grad()
-            loss.backward()
+            g_loss.backward()
             g_optimizer.step()
-            # Print loss per step
-            print(f"[Round {round_num} | Step {step + 1}/{steps}] Generator Loss: {loss.item():.4f}")
 
+            print(f"[Round {round_num} | Step {step + 1}/{steps}] Generator Loss (WGAN): {g_loss.item():.4f}")
+
+            # Logging and visualization every 50 steps
             if step % 50 == 0:
                 self.generator.eval()
                 with torch.no_grad():
-                    z_vis = torch.randn(16, self.latent_dim, 1, 1).to(DEVICE)
+                    z_vis = torch.randn(16, self.latent_dim).to(DEVICE)
                     fake_imgs_vis = self.generator(z_vis)
+                    # Denormalize for visualization
+                    fake_imgs_vis = (fake_imgs_vis + 1) / 2
                     img_grid = torchvision.utils.make_grid(fake_imgs_vis, nrow=4, normalize=True)
-                    self.writer.add_image("Generator/FakeImages", img_grid, global_step=step)
+                    self.writer.add_image(f"Generator/Round_{round_num}/FakeImages", img_grid, global_step=step)
                     torchvision.utils.save_image(img_grid, os.path.join(self.run_dir, f"round_{round_num:03}_{step}.png"))
 
                 self.generator.train()
-                # Log scalar loss
-                self.writer.add_scalar("Generator/Loss", loss.item(), global_step=step)
 
+                # Log scalar WGAN loss
+                self.writer.add_scalar("Generator/Loss_Wasserstein", g_loss.item(), global_step=step)
 
     def evaluate(self, parameters, config):
         # set_parameters(self.dummy_model, parameters)
         # loss, acc = test(self.dummy_model, self.valloader)
         # return float(loss), len(self.valloader), {"accuracy": float(acc)}
 
-        print(f'params inside client evaluate: {parameters}')
+        #print(f'params inside client evaluate: {parameters}')
         set_parameters(self.global_cnn, parameters)
         loss, accuracy = test(self.global_cnn, self.valloader)
         return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
 
+    # ✅ Updated train_generator_with_global_model_gradient with TV loss, confidence logging, and class sweep
+
+    # ✅ Updated train_generator_with_global_model_gradient with fixed target class (7), confidence loss, and TV regularization
+
+    def train_generator_with_global_model_gradient(self, round_num, steps=1000):
+        self.generator.train()
+        self.global_cnn.eval()
+
+        g_optimizer = torch.optim.Adam(self.generator.parameters(), lr=2e-4)
+        confidence_loss_weight = 1.0
+        diversity_loss_weight = 0.1
+
+        target_class = 8  # fixed target class
+        print(f"🎯 Target class for generator inversion: {target_class}")
+
+        for step in range(steps):
+            z = torch.randn(BATCH_SIZE, self.latent_dim).to(DEVICE)
+            target_labels = torch.full((BATCH_SIZE,), target_class, dtype=torch.long, device=DEVICE)
+
+            fake_imgs = self.generator(z, target_labels)
+            logits = self.global_cnn(fake_imgs)
+
+            # Confidence loss (maximize logit for target class)
+            confidence_loss = -logits[:, target_class].mean()
+
+            # Diversity loss using intermediate CNN features (fc2 layer output)
+            with torch.no_grad():
+                x = fake_imgs
+                for conv in self.global_cnn.convs:
+                    x = self.global_cnn.pool(F.relu(conv(x)))
+                x = x.view(x.size(0), -1)
+                x = F.relu(self.global_cnn.fc1(x))
+                feat_fc2 = F.relu(self.global_cnn.fc2(x))
+                features = feat_fc2
+
+            half = BATCH_SIZE // 2
+            diversity_loss = -F.l1_loss(features[:half], features[half:])
+
+            loss = confidence_loss_weight * confidence_loss + diversity_loss_weight * diversity_loss
+
+            g_optimizer.zero_grad()
+            loss.backward()
+            g_optimizer.step()
+
+            if (step+1) % 50 == 0:
+                print(
+                    f"[Round {round_num} | Step {step}] Inversion Loss: {loss.item():.4f} | Confidence: {confidence_loss.item():.4f} | Diversity: {diversity_loss.item():.4f}")
+                self.generator.eval()
+                with torch.no_grad():
+                    z_vis = torch.randn(16, self.latent_dim).to(DEVICE)
+                    print(f"[Debug] z_vis std: {z_vis.std(dim=0).mean().item():.4f} | min: {z_vis.min().item():.2f}, max: {z_vis.max().item():.2f}")
+                    print("[Debug] First z_vis sample:", z_vis[0][:5].detach().cpu().numpy())  # prints first 5 dims of first vector
+
+                    labels_vis = torch.full((16,), target_class, device=DEVICE)
+                    fake_imgs_vis = self.generator(z_vis, labels_vis)
+                    img_vis = (fake_imgs_vis + 1) / 2
+                    grid = torchvision.utils.make_grid(img_vis, nrow=4, normalize=False)
+                    self.writer.add_image(f"Generator/Round_{round_num}/Class_{target_class}/Inversion", grid,
+                                          global_step=step)
+                    torchvision.utils.save_image(grid, os.path.join(self.run_dir,
+                                                                    f"round{round_num:02}_class{target_class}_step{step}.png"))
+                self.generator.train()
+                self.writer.add_scalar(f"Generator/Round_{round_num}/Class_{target_class}/Inversion_Loss", loss.item(),
+                                       global_step=step)
 
 
 def server_fn(context: Context) -> ServerAppComponents:
@@ -531,31 +620,31 @@ def server_fn(context: Context) -> ServerAppComponents:
 def main():
     #Setup Federated Learning
 
-    trainloader, _, _, input_channels, input_size, num_classes = load_datasets(partition_id=0)
-    print(f"Data shape: {input_channels}x{input_size}, Num classes: {num_classes}")
-
-    batch = next(iter(trainloader))
-    images, labels = batch["image"], batch["label"]
-
-    # Reshape and convert images to a NumPy array
-    # matplotlib requires images with the shape (height, width, 3)
-    images = images.squeeze(1).numpy()
-
-    # Denormalize
-    images = images / 2 + 0.5
-
-    # Create a figure and a grid of subplots
-    fig, axs = plt.subplots(4, 8, figsize=(12, 6))
-
-    # Loop over the images and plot them
-    for i, ax in enumerate(axs.flat):
-        ax.imshow(images[i], cmap="gray")
-        ax.set_title(trainloader.dataset.features["label"].int2str([labels[i]])[0])
-        ax.axis("off")
-
-    # Show the plot
-    fig.tight_layout()
-    plt.show()
+    # trainloader, _, _, input_channels, input_size, num_classes = load_datasets(partition_id=0)
+    # print(f"Data shape: {input_channels}x{input_size}, Num classes: {num_classes}")
+    #
+    # batch = next(iter(trainloader))
+    # images, labels = batch["image"], batch["label"]
+    #
+    # # Reshape and convert images to a NumPy array
+    # # matplotlib requires images with the shape (height, width, 3)
+    # images = images.squeeze(1).numpy()
+    #
+    # # Denormalize
+    # images = images / 2 + 0.5
+    #
+    # # Create a figure and a grid of subplots
+    # fig, axs = plt.subplots(4, 8, figsize=(12, 6))
+    #
+    # # Loop over the images and plot them
+    # for i, ax in enumerate(axs.flat):
+    #     ax.imshow(images[i], cmap="gray")
+    #     ax.set_title(trainloader.dataset.features["label"].int2str([labels[i]])[0])
+    #     ax.axis("off")
+    #
+    # # Show the plot
+    # fig.tight_layout()
+    # plt.show()
 
     # Create the ClientApp
     client = ClientApp(client_fn=client_fn)
@@ -569,7 +658,7 @@ def main():
 
     # When running on GPU, assign an entire GPU for each client
     if DEVICE == "cuda":
-        backend_config = {"client_resources": {"num_cpus": 20, "num_gpus": 1.0}}
+        backend_config = {"client_resources": {"num_cpus": 20, "num_gpus": 0.5}}
         # Refer to our Flower framework documentation for more details about Flower simulations
         # and how to set up the `backend_config`
 
