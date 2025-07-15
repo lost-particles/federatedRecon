@@ -37,6 +37,10 @@ pip install -r requirements.txt
 # Run federated training with GAN attack
 python GAN_Data_Leakage.py
 
+
 ## References
-- Briland Hitaj, Giuseppe Ateniese, and Fernando Perez-Cruz. 2017. Deep Models Under the GAN: Information Leakage from Collaborative Deep Learning. In Proceedings of the 2017 ACM SIGSAC Conference on Computer and Communications Security (CCS ‘17). Association for Computing Machinery, New York, NY, USA, 603–618. https://doi.org/10.1145/3133956.3134012
-- Ligeng Zhu, Zhijian Liu, and Song Han. 2019. Deep Leakage from Gradients. arXiv:1906.08935 [cs.LG]. https://doi.org/10.48550/arXiv.1906.08935
+
+- Briland Hitaj, Giuseppe Ateniese, and Fernando Perez-Cruz. 2017. *Deep Models Under the GAN: Information Leakage from Collaborative Deep Learning*. In *Proceedings of the 2017 ACM SIGSAC Conference on Computer and Communications Security (CCS ‘17)*. Association for Computing Machinery, New York, NY, USA, 603–618. [https://doi.org/10.1145/3133956.3134012](https://doi.org/10.1145/3133956.3134012)
+
+- Ligeng Zhu, Zhijian Liu, and Song Han. 2019. *Deep Leakage from Gradients*. arXiv:1906.08935 [cs.LG]. [https://doi.org/10.48550/arXiv.1906.08935](https://doi.org/10.48550/arXiv.1906.08935)
+
