@@ -36,7 +36,7 @@ pip install -r requirements.txt
 
 # Run federated training with GAN attack
 python GAN_Data_Leakage.py
-
+```
 
 ## References
 
