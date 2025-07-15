@@ -2,6 +2,11 @@
 
 This project demonstrates a proof-of-concept **GAN-based reconstruction attack** in a federated learning setup. A **malicious client** uses gradient updates from the global model to reconstruct private data (e.g., handwritten digit “9” or celebrity faces) that it has never directly accessed.
 
+## 📄 Full Walkthrough
+For a detailed explanation, illustrations, and experimental results, read the article on Medium:
+**"Federated Recon: GAN‑Based Reconstruction Attack In A Federated Learning Setup"**  
+➤ https://medium.com/@lost_particles/federated-recon-gan-based-reconstruction-attack-in-a-federated-learning-setup-4545672162e3
+
 ## 🚀 Core Components
 - **Federated Learning Simulation**  
   Built with PyTorch and Flower, simulating two or more clients training on disjoint data subsets (e.g., MNIST digits 0–4 vs. 5–9).
@@ -10,10 +15,6 @@ This project demonstrates a proof-of-concept **GAN-based reconstruction attack**
 - **Reconstructions on MNIST & CelebA**  
   Shows how realistic reconstructions emerge, including faint facial outlines on CelebA without ever seeing the actual celebrity images.
 
-## 📄 Full Walkthrough
-For a detailed explanation, illustrations, and experimental results, read the article on Medium:
-**"Federated Recon: GAN‑Based Reconstruction Attack In A Federated Learning Setup"**  
-➤ https://medium.com/@lost_particles/federated-recon-gan-based-reconstruction-attack-in-a-federated-learning-setup-4545672162e3
 
 ## 💡 Why It Matters
 Federated learning is often seen as a privacy-first approach—but this work highlights that **shared gradients can leak sensitive data**. Understanding GAN-based inversion attacks helps underscore the need for rigorous privacy defenses.
